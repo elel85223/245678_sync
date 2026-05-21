@@ -5,11 +5,15 @@
   1. HTTP GET на эндпоинт ЛК /local/tools/gifts_status_export/
      с action=sync_and_export. Эндпоинт сам запускает gifts_sync.php
      (Google -> HL) и возвращает JSON со всеми записями HL-45.
-  2. Дедуплицируем items по external_id (берём с max id).
+  2. Группируем items по external_id, для каждой группы берём запись с max id
+     (если по одному ключу в HL несколько записей — выбираем самую свежую).
   3. Открываем Google-таблицу через service account.
-  4. Сопоставляем строки таблицы с записями HL по ключу
-     R (УПД) + L (артикул) + F (ИНН).
-  5. Обновляем столбец T одним батч-запросом:
+  4. Строим индекс ключ -> список строк таблицы с этим ключом
+     (в Google законно может быть несколько одинаковых строк — например,
+     одна клиника получила в одном УПД два экземпляра одного артикула двумя
+     строками; обе строки реальные, обе должны получить статус).
+  5. Обновляем столбец T одним батч-запросом для всех строк, у которых
+     текущее значение отличается от целевого:
        SHIPPED   -> "Отправлен PROTECO"
        DELIVERED -> "Передан клинике DD.MM.YYYY"
 
@@ -92,8 +96,12 @@ def fetch_hl_items():
     return data.get("items", [])
 
 
-def dedupe_items(items):
-    """Дедупликация по external_id, берём запись с max id."""
+def group_items_by_key(items):
+    """
+    Группировка items HL по external_id.
+    Если по ключу несколько записей — берём с max id (самая свежая).
+    Возвращает dict key -> item.
+    """
     by_key = {}
     for item in items:
         ext = item.get("external_id", "")
@@ -102,13 +110,13 @@ def dedupe_items(items):
         if ext not in by_key or item["id"] > by_key[ext]["id"]:
             by_key[ext] = item
 
-    if len(by_key) != len(items):
-        log.warning(
-            "Дедупликация: %d -> %d (удалено: %d)",
-            len(items), len(by_key), len(items) - len(by_key),
+    collapsed = len(items) - len(by_key)
+    if collapsed > 0:
+        log.info(
+            "В HL обнаружено записей с одинаковым ключом: %d (объединены, "
+            "взята запись с max id)", collapsed,
         )
-
-    return list(by_key.values())
+    return by_key
 
 
 def open_sheet():
@@ -135,18 +143,19 @@ def open_sheet():
 
 
 def build_index(ws):
-    """Читает таблицу и строит индекс ключ -> (row_index, current_status)."""
+    """
+    Читает таблицу и строит индекс ключ -> список (row_idx, current_status).
+    В Google законно может быть несколько одинаковых строк — все попадают в список.
+    """
     all_values = ws.get_all_values()
     log.info("Загружено строк из таблицы: %d", len(all_values))
 
     index = {}
-    duplicates = []
 
     for i, row in enumerate(all_values, start=1):
         if i == 1:
             continue  # заголовок
 
-        # Дополняем строку до нужной длины
         if len(row) < COL_STATUS:
             row = row + [""] * (COL_STATUS - len(row))
 
@@ -159,17 +168,23 @@ def build_index(ws):
             continue  # неполная строка, пропускаем
 
         key = upd + "__" + article + "__" + inn
-        if key in index:
-            duplicates.append((i, key))
-            continue
-        index[key] = (i, current_status)
+        index.setdefault(key, []).append((i, current_status))
 
-    if duplicates:
-        log.warning("В Google-таблице найдено дублей ключа: %d", len(duplicates))
-        for row_idx, key in duplicates[:5]:
-            log.warning("  row %d: %s", row_idx, key)
+    multi = {k: rows for k, rows in index.items() if len(rows) > 1}
+    if multi:
+        log.info(
+            "В Google-таблице ключей с несколькими строками: %d "
+            "(все строки будут обновлены)", len(multi),
+        )
+        for k, rows in list(multi.items())[:5]:
+            row_idxs = ", ".join(str(r[0]) for r in rows)
+            log.info("  ключ %s -> строки %s", k, row_idxs)
 
-    log.info("Уникальных строк с заполненным ключом: %d", len(index))
+    total_rows = sum(len(rows) for rows in index.values())
+    log.info(
+        "Уникальных ключей: %d, всего строк с ключом: %d",
+        len(index), total_rows,
+    )
     return index
 
 
@@ -191,37 +206,38 @@ def format_status_text(item):
     return None
 
 
-def compute_updates(items, sheet_index):
-    """Сопоставляет HL-items со строками таблицы, готовит batch-updates."""
+def compute_updates(items_by_key, sheet_index):
+    """
+    Сопоставляет items HL со строками таблицы.
+    Для каждого ключа обновляет ВСЕ строки Google с этим ключом.
+    """
     updates = []
     not_found = []
     no_change = 0
+    rows_checked = 0
 
-    for item in items:
-        key = item.get("external_id", "")
-        if not key:
-            continue
-
+    for key, item in items_by_key.items():
         if key not in sheet_index:
             not_found.append((key, item.get("id")))
             continue
 
-        row_idx, current_status = sheet_index[key]
         new_status = format_status_text(item)
         if new_status is None:
             continue
 
-        if current_status == new_status:
-            no_change += 1
-            continue
+        for row_idx, current_status in sheet_index[key]:
+            rows_checked += 1
+            if current_status == new_status:
+                no_change += 1
+                continue
+            updates.append({
+                "range": "T" + str(row_idx),
+                "values": [[new_status]],
+            })
 
-        updates.append({
-            "range": "T" + str(row_idx),
-            "values": [[new_status]],
-        })
-
-    log.info("Подготовлено обновлений: %d", len(updates))
+    log.info("Строк к проверке: %d", rows_checked)
     log.info("Уже актуальны (без изменений): %d", no_change)
+    log.info("Подготовлено обновлений: %d", len(updates))
     if not_found:
         log.warning("Не найдено в Google-таблице: %d", len(not_found))
         for key, hl_id in not_found[:10]:
@@ -248,11 +264,11 @@ def main():
         log.warning("Эндпоинт не вернул ни одной записи — нечего синхронизировать")
         return
 
-    items = dedupe_items(items)
+    items_by_key = group_items_by_key(items)
 
     ws = open_sheet()
     sheet_index = build_index(ws)
-    updates = compute_updates(items, sheet_index)
+    updates = compute_updates(items_by_key, sheet_index)
     apply_updates(ws, updates)
 
     log.info("=== Готово ===")
