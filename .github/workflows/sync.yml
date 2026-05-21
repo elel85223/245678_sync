@@ -1,0 +1,34 @@
+name: Sync gifts statuses
+
+on:
+  schedule:
+    # Каждый час в 30-ю минуту (UTC)
+    - cron: '30 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run agent
+        env:
+          LK_ENDPOINT_URL: https://lk-proteco.ru/local/tools/gifts_status_export/
+          LK_GIFTS_STATUS_TOKEN: ${{ secrets.LK_GIFTS_STATUS_TOKEN }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          GOOGLE_SHEET_ID: 16S0zru6DLGVj4QU_fehVeBzoH2wzJOu8SBKSOyrIefo
+          GOOGLE_SHEET_NAME: Лист1
+          HTTP_TIMEOUT: '600'
+        run: python agent.py
