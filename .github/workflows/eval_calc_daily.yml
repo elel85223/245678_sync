@@ -1,0 +1,52 @@
+name: Eval calc daily
+
+on:
+  schedule:
+    # 16:00 UTC = 19:00 МСК
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим (write - запись в СП 190, dry - без записи)'
+        required: true
+        default: 'dry'
+        type: choice
+        options:
+          - dry
+          - write
+
+jobs:
+  eval-calc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Запуск расчета Листа оценки
+        env:
+          TOKEN: ${{ secrets.EVAL_CALC_TOKEN }}
+          MODE: ${{ github.event.inputs.mode || 'write' }}
+        run: |
+          echo "Режим: $MODE"
+          HTTP_CODE=$(curl -sS -m 900 -o response.json -w '%{http_code}' \
+            "https://crm.ptcd.ru/local/tools/eval_calc/index.php" \
+            --data-urlencode "agent_token=${TOKEN}" \
+            --data-urlencode "agent_mode=${MODE}")
+
+          echo "HTTP: $HTTP_CODE"
+          echo "--- Ответ ---"
+          jq . response.json 2>/dev/null || cat response.json
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Расчет завершился с ошибкой (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          OK=$(jq -r '.ok' response.json)
+          if [ "$OK" != "true" ]; then
+            echo "::error::Расчет вернул ok=false"
+            exit 1
+          fi
+
+          PERIOD=$(jq -r '.period' response.json)
+          COUNT=$(jq -r '.distributors' response.json)
+          WRITTEN=$(jq -r '.written' response.json)
+          echo "Готово: $PERIOD, дистрибьюторов $COUNT, записано $WRITTEN"
