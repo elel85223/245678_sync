@@ -26,7 +26,7 @@ jobs:
           MODE: ${{ github.event.inputs.mode || 'write' }}
         run: |
           echo "Режим: $MODE"
-          HTTP_CODE=$(curl -sS -m 900 -o response.json -w '%{http_code}' \
+          HTTP_CODE=$(curl -sS -G -m 900 -o response.json -w '%{http_code}' \
             "https://crm.ptcd.ru/local/tools/eval_calc/index.php" \
             --data-urlencode "agent_token=${TOKEN}" \
             --data-urlencode "agent_mode=${MODE}")
