@@ -2,7 +2,8 @@ name: Eval calc daily
 
 on:
   schedule:
-    # 16:00 UTC = 19:00 МСК
+    # 10:30 UTC = 13:30 МСК, 16:00 UTC = 19:00 МСК
+    - cron: '30 10 * * *'
     - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
