@@ -1,23 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Агент синхронизации дистрибьюторов: Битрикс24 CRM -> litics.partners
-
-Логика:
-1. crm.company.list: компании с UF_CRM_1668428521 = 182039 (страна Россия)
-   и COMPANY_TYPE in (OTHER = Дистрибьютор, 11 = Дистрибьютор (не активный)).
-2. Для каждого РМ (UF_CRM_1641999321) - user.get: ФИО, email, телефон.
-3. Справочник федеральных округов: lists.element.get (IBLOCK_ID=119), ID -> NAME.
-4. litics.partners: ключ externalId = ID компании Б24.
-   Есть строка - UPDATE изменившихся полей, нет - INSERT (country_code='RU').
-
-Обновляемые поля partners:
-  name, taxNumber, company_type, federal_district,
-  regional_manager_id, regional_manager_name,
-  regional_manager_email, regional_manager_phone
-
-Переменные окружения (GitHub Secrets):
-  B24_WEBHOOK  - вебхук Битрикс24 (с завершающим /)
-  DB_HOST, DB_NAME, DB_USER, DB_PASSWORD - MySQL Litics
 """
 
 import os
@@ -41,10 +24,18 @@ F_COUNTRY = "UF_CRM_1668428521"
 F_RM = "UF_CRM_1641999321"          # ID пользователя Б24 (РМ)
 F_INN = "UF_CRM_1646855368887"
 F_FED_DISTRICT = "UF_CRM_1650959251"  # ID элемента списка (инфоблок 119)
+F_DIRECTION = "UF_CRM_1785492097"     # Направление / Организация (множественное)
 FED_DISTRICT_IBLOCK = 119
 
+DIRECTION_NAMES = {
+    "5674": "ПРОТЕКО",
+    "5675": "ПРОТЕКОЛАБ",
+}
+DIRECTION_PROTECO = "5674"
+
+# Поля, участвующие в UPDATE (name и taxNumber намеренно исключены)
 SYNC_FIELDS = [
-    "name", "taxNumber", "company_type", "federal_district",
+    "company_type", "federal_district", "direction",
     "regional_manager_id", "regional_manager_name",
     "regional_manager_email", "regional_manager_phone",
 ]
@@ -68,22 +59,41 @@ def b24_call(method, params=None):
             time.sleep(3)
 
 
+def direction_ids(company):
+    """Значения поля Направление как множество строк."""
+    raw = company.get(F_DIRECTION)
+    if not raw:
+        return set()
+    if not isinstance(raw, list):
+        raw = [raw]
+    return {str(v) for v in raw if v}
+
+
 def fetch_companies():
-    """Все компании РФ с типом Дистрибьютор / Дистрибьютор (не активный)."""
+    """Компании РФ (Дистрибьютор / неактивный) с Направлением ПРОТЕКО."""
     companies = []
+    skipped = 0
     for ctype in COMPANY_TYPES:
         start = 0
         while True:
             data = b24_call("crm.company.list", {
                 "filter": {"COMPANY_TYPE": ctype, F_COUNTRY: COUNTRY_RU_ENUM},
-                "select": ["ID", "TITLE", "COMPANY_TYPE", F_RM, F_INN, F_FED_DISTRICT],
+                "select": ["ID", "TITLE", "COMPANY_TYPE",
+                           F_RM, F_INN, F_FED_DISTRICT, F_DIRECTION],
                 "start": start,
             })
-            companies.extend(data.get("result", []))
+            for c in data.get("result", []):
+                if DIRECTION_PROTECO in direction_ids(c):
+                    companies.append(c)
+                else:
+                    skipped += 1
+                    print(f"  Пропуск id={c['ID']} ({c.get('TITLE')}): "
+                          f"Направление={sorted(direction_ids(c)) or 'пусто'}")
             if "next" not in data:
                 break
             start = data["next"]
             time.sleep(0.5)
+    print(f"   Пропущено по Направлению: {skipped}")
     return companies
 
 
@@ -143,11 +153,13 @@ def build_target_rows(companies, users, districts):
         rm_id = norm(c.get(F_RM))
         rm = users.get(rm_id, {}) if rm_id else {}
         fd_id = norm(c.get(F_FED_DISTRICT))
+        dirs = sorted(direction_ids(c))
         rows[ext_id] = {
             "name": norm(c.get("TITLE")),
             "taxNumber": norm(c.get(F_INN)),
             "company_type": COMPANY_TYPES[c["COMPANY_TYPE"]],
             "federal_district": districts.get(fd_id) if fd_id else None,
+            "direction": ", ".join(DIRECTION_NAMES.get(d, d) for d in dirs) or None,
             "regional_manager_id": int(rm_id) if rm_id and rm_id.isdigit() else None,
             "regional_manager_name": rm.get("name"),
             "regional_manager_email": rm.get("email"),
@@ -165,7 +177,7 @@ def sync_db(target):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, externalId, name, taxNumber, company_type, federal_district, "
+                "SELECT id, externalId, company_type, federal_district, direction, "
                 "regional_manager_id, regional_manager_name, regional_manager_email, "
                 "regional_manager_phone FROM partners WHERE externalId IN ({})".format(
                     ",".join(["%s"] * len(target))
@@ -185,9 +197,6 @@ def sync_db(target):
                             old_v = int(old_v) if old_v is not None else None
                         else:
                             old_v = norm(old_v)
-                        # taxNumber в БД NOT NULL: пустое значение из Б24 не затираем
-                        if f == "taxNumber" and new_v is None:
-                            continue
                         if new_v != old_v:
                             changes[f] = new_v
                     if changes:
@@ -206,13 +215,13 @@ def sync_db(target):
                         continue
                     cur.execute(
                         "INSERT INTO partners (name, taxNumber, externalId, country_code, "
-                        "company_type, federal_district, regional_manager_id, "
+                        "company_type, federal_district, direction, regional_manager_id, "
                         "regional_manager_name, regional_manager_email, regional_manager_phone) "
-                        "VALUES (%s, %s, %s, 'RU', %s, %s, %s, %s, %s, %s)",
+                        "VALUES (%s, %s, %s, 'RU', %s, %s, %s, %s, %s, %s, %s)",
                         [row["name"], row["taxNumber"], ext_id, row["company_type"],
-                         row["federal_district"], row["regional_manager_id"],
-                         row["regional_manager_name"], row["regional_manager_email"],
-                         row["regional_manager_phone"]],
+                         row["federal_district"], row["direction"],
+                         row["regional_manager_id"], row["regional_manager_name"],
+                         row["regional_manager_email"], row["regional_manager_phone"]],
                     )
                     inserted += 1
                     print(f"INSERT externalId={ext_id}: {row['name']}")
@@ -228,7 +237,7 @@ def sync_db(target):
 def main():
     print("1. Компании из Б24...")
     companies = fetch_companies()
-    print(f"   Получено: {len(companies)}")
+    print(f"   Отобрано (Направление = ПРОТЕКО): {len(companies)}")
     if not companies:
         print("Компании не получены, синхронизация прервана.")
         sys.exit(1)
