@@ -77,7 +77,8 @@ def fetch_companies():
         start = 0
         while True:
             data = b24_call("crm.company.list", {
-                "filter": {"COMPANY_TYPE": ctype, F_COUNTRY: COUNTRY_RU_ENUM},
+                "filter": {"COMPANY_TYPE": ctype, F_COUNTRY: COUNTRY_RU_ENUM,
+                           "IS_MY_COMPANY": "N"},
                 "select": ["ID", "TITLE", "COMPANY_TYPE",
                            F_RM, F_INN, F_FED_DISTRICT, F_DIRECTION],
                 "start": start,
