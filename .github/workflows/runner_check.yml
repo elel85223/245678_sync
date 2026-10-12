@@ -1,0 +1,65 @@
+name: Runner check
+
+# Проверка офисного раннера: под какой учеткой работает служба,
+# есть ли Python и 7-Zip, открыты ли порты баз ПрофиСферы и Litics.
+# Ничего не устанавливает и не меняет. Запуск только вручную.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 10
+    steps:
+      - name: Учетная запись, Python, 7-Zip
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "User:       $(whoami)"
+          "Computer:   $env:COMPUTERNAME"
+          "OS:         $([System.Environment]::OSVersion.VersionString)"
+          "PowerShell: $($PSVersionTable.PSVersion)"
+          "Tool cache: $env:RUNNER_TOOL_CACHE"
+          ""
+          foreach ($name in 'python', 'python3', 'py', 'pip', '7z') {
+            $cmd = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cmd) { "PATH $($name): $($cmd.Source)" } else { "PATH $($name): not found" }
+          }
+          ""
+          $py = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($py) {
+            & $py.Source --version 2>&1 | ForEach-Object { "python --version: $_" }
+            & $py.Source -m pip --version 2>&1 | ForEach-Object { "pip: $_" }
+          }
+          $launcher = Get-Command py -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($launcher) {
+            & $launcher.Source -0p 2>&1 | ForEach-Object { "py -0p: $_" }
+          }
+          ""
+          Get-ChildItem 'HKLM:\SOFTWARE\Python\PythonCore' -ErrorAction SilentlyContinue |
+            ForEach-Object { "Python for all users (registry): $($_.PSChildName)" }
+          Get-ChildItem "$env:ProgramFiles\Python*", 'C:\Python*' -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { "Python folder: $($_.FullName)" }
+          foreach ($p in "$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe") {
+            if (Test-Path -LiteralPath $p) { "7-Zip: $p" }
+          }
+          exit 0
+
+      - name: Доступ к базам
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          foreach ($target in @('185.174.165.138:6432', '31.129.97.100:3306')) {
+            $hostName, $port = $target.Split(':')
+            $client = New-Object System.Net.Sockets.TcpClient
+            try {
+              $ok = $client.ConnectAsync($hostName, [int]$port).Wait(5000) -and $client.Connected
+            } catch {
+              $ok = $false
+            } finally {
+              $client.Close()
+            }
+            if ($ok) { "$($target): open" } else { "$($target): closed" }
+          }
+          exit 0
