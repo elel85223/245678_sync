@@ -45,6 +45,7 @@ jobs:
       - name: Запуск агента зеркала
         shell: powershell
         env:
+          PYTHONIOENCODING: utf-8
           MODE: ${{ github.event.inputs.mode || 'write' }}
           LKD_PG_HOST: ${{ secrets.LKD_PG_HOST }}
           LKD_PG_USER: ${{ secrets.LKD_PG_USER }}
