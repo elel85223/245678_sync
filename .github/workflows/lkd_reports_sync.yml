@@ -1,0 +1,57 @@
+name: LKD reports sync
+
+# Зеркало отчетов нового ЛКД в litics.lkd_reports.
+# Раннер self-hosted в офисе (база ПрофиСферы пускает только с офисного адреса).
+# Ручной запуск: режим dry (без записи) или write. По расписанию - write.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим (dry - без записи, write - запись в litics.lkd_reports)'
+        required: true
+        default: 'dry'
+        type: choice
+        options:
+          - dry
+          - write
+  schedule:
+    - cron: '0 5 * * *'    # 08:00 МСК
+    - cron: '0 17 * * *'   # 20:00 МСК
+
+jobs:
+  sync:
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 20
+    steps:
+      - name: Загрузка агента из репозитория
+        shell: powershell
+        run: |
+          # Windows PowerShell 5.1 по умолчанию может не использовать TLS 1.2
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          # Скачиваем один файл агента напрямую, без git на машине
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://raw.githubusercontent.com/elel85223/245678_sync/main/lkd_reports_sync_agent.py" `
+            -OutFile "lkd_reports_sync_agent.py"
+          if (-not (Test-Path "lkd_reports_sync_agent.py")) { throw "Агент не скачался" }
+
+      - name: Виртуальное окружение и зависимости
+        shell: powershell
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip --quiet
+          .\.venv\Scripts\python.exe -m pip install --quiet "psycopg[binary]" pymysql
+
+      - name: Запуск агента зеркала
+        shell: powershell
+        env:
+          MODE: ${{ github.event.inputs.mode || 'write' }}
+          LKD_PG_HOST: ${{ secrets.LKD_PG_HOST }}
+          LKD_PG_USER: ${{ secrets.LKD_PG_USER }}
+          LKD_PG_PASSWORD: ${{ secrets.LKD_PG_PASSWORD }}
+          LITICS_DB_HOST: ${{ secrets.DB_HOST }}
+          LITICS_DB_NAME: ${{ secrets.DB_NAME }}
+          LITICS_DB_USER: ${{ secrets.DB_USER }}
+          LITICS_DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          .\.venv\Scripts\python.exe lkd_reports_sync_agent.py
