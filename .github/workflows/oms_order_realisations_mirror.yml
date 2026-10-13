@@ -1,0 +1,66 @@
+name: Order realisations mirror
+
+# Зеркало реализаций заказов ИМ из ЛКД (prod_oms, prod_sellers) в litics.pf_oms_order_realisations
+# с найденным документом Sell Out. Агент: oms_order_realisations_mirror_agent.py.
+# Раннер self-hosted в офисе (база ПрофиСферы пускает только с офисного адреса).
+# Пока только ручной запуск: режим dry (без записи) или write и учетка Litics.
+# Расписание добавим после проверки прав учеток.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим (dry - без записи, write - запись в зеркало)'
+        required: true
+        default: 'dry'
+        type: choice
+        options:
+          - dry
+          - write
+      account:
+        description: 'Учетка Litics: секреты DB_USER/DB_PASSWORD или LITICS_MIRROR_USER/LITICS_MIRROR_PASSWORD'
+        required: true
+        default: 'DB_USER'
+        type: choice
+        options:
+          - DB_USER
+          - LITICS_MIRROR_USER
+
+jobs:
+  mirror:
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 20
+    steps:
+      - name: Загрузка агента из репозитория
+        shell: powershell
+        run: |
+          # Windows PowerShell 5.1 по умолчанию может не использовать TLS 1.2
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          # Скачиваем один файл агента напрямую, без git на машине
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://raw.githubusercontent.com/elel85223/245678_sync/main/oms_order_realisations_mirror_agent.py" `
+            -OutFile "oms_order_realisations_mirror_agent.py"
+          if (-not (Test-Path "oms_order_realisations_mirror_agent.py")) { throw "Агент не скачался" }
+
+      - name: Виртуальное окружение и зависимости
+        shell: powershell
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip --quiet
+          .\.venv\Scripts\python.exe -m pip install --quiet "psycopg[binary]" pymysql
+
+      - name: Запуск агента
+        shell: powershell
+        env:
+          PYTHONIOENCODING: utf-8
+          MODE: ${{ github.event.inputs.mode || 'dry' }}
+          LKD_PG_HOST: ${{ secrets.LKD_PG_HOST }}
+          LKD_PG_USER: ${{ secrets.LKD_PG_USER }}
+          LKD_PG_PASSWORD: ${{ secrets.LKD_PG_PASSWORD }}
+          LITICS_DB_HOST: ${{ secrets.DB_HOST }}
+          LITICS_DB_NAME: ${{ secrets.DB_NAME }}
+          LITICS_DB_USER: ${{ github.event.inputs.account == 'LITICS_MIRROR_USER' && secrets.LITICS_MIRROR_USER || secrets.DB_USER }}
+          LITICS_DB_PASSWORD: ${{ github.event.inputs.account == 'LITICS_MIRROR_USER' && secrets.LITICS_MIRROR_PASSWORD || secrets.DB_PASSWORD }}
+        run: |
+          Write-Output "Litics account secret: ${{ github.event.inputs.account || 'DB_USER' }}"
+          .\.venv\Scripts\python.exe oms_order_realisations_mirror_agent.py
