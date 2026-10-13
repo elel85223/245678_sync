@@ -3,8 +3,8 @@ name: Order realisations mirror
 # Зеркало реализаций заказов ИМ из ЛКД (prod_oms, prod_sellers) в litics.pf_oms_order_realisations
 # с найденным документом Sell Out. Агент: oms_order_realisations_mirror_agent.py.
 # Раннер self-hosted в офисе (база ПрофиСферы пускает только с офисного адреса).
-# Пока только ручной запуск: режим dry (без записи) или write и учетка Litics.
-# Расписание добавим после проверки прав учеток.
+# По расписанию: режим write под учеткой из секретов LITICS_MIRROR_USER / LITICS_MIRROR_PASSWORD.
+# Ручной запуск: режим dry (без записи) или write и учетка Litics на выбор.
 
 on:
   workflow_dispatch:
@@ -18,13 +18,17 @@ on:
           - dry
           - write
       account:
-        description: 'Учетка Litics: секреты DB_USER/DB_PASSWORD или LITICS_MIRROR_USER/LITICS_MIRROR_PASSWORD'
+        description: 'Учетка Litics: секреты LITICS_MIRROR_USER/LITICS_MIRROR_PASSWORD или DB_USER/DB_PASSWORD'
         required: true
-        default: 'DB_USER'
+        default: 'LITICS_MIRROR_USER'
         type: choice
         options:
-          - DB_USER
           - LITICS_MIRROR_USER
+          - DB_USER
+  schedule:
+    - cron: '10 8 * * *'    # 11:10 МСК, после загрузки CISLink в 10:25
+    - cron: '10 12 * * *'   # 15:10 МСК, после загрузки CISLink в 14:30
+    - cron: '10 17 * * *'   # 20:10 МСК, реализации за день
 
 jobs:
   mirror:
@@ -53,14 +57,14 @@ jobs:
         shell: powershell
         env:
           PYTHONIOENCODING: utf-8
-          MODE: ${{ github.event.inputs.mode || 'dry' }}
+          MODE: ${{ github.event.inputs.mode || 'write' }}
           LKD_PG_HOST: ${{ secrets.LKD_PG_HOST }}
           LKD_PG_USER: ${{ secrets.LKD_PG_USER }}
           LKD_PG_PASSWORD: ${{ secrets.LKD_PG_PASSWORD }}
           LITICS_DB_HOST: ${{ secrets.DB_HOST }}
           LITICS_DB_NAME: ${{ secrets.DB_NAME }}
-          LITICS_DB_USER: ${{ github.event.inputs.account == 'LITICS_MIRROR_USER' && secrets.LITICS_MIRROR_USER || secrets.DB_USER }}
-          LITICS_DB_PASSWORD: ${{ github.event.inputs.account == 'LITICS_MIRROR_USER' && secrets.LITICS_MIRROR_PASSWORD || secrets.DB_PASSWORD }}
+          LITICS_DB_USER: ${{ (github.event.inputs.account || 'LITICS_MIRROR_USER') == 'LITICS_MIRROR_USER' && secrets.LITICS_MIRROR_USER || secrets.DB_USER }}
+          LITICS_DB_PASSWORD: ${{ (github.event.inputs.account || 'LITICS_MIRROR_USER') == 'LITICS_MIRROR_USER' && secrets.LITICS_MIRROR_PASSWORD || secrets.DB_PASSWORD }}
         run: |
-          Write-Output "Litics account secret: ${{ github.event.inputs.account || 'DB_USER' }}"
+          Write-Output "Litics account secret: ${{ github.event.inputs.account || 'LITICS_MIRROR_USER' }}"
           .\.venv\Scripts\python.exe oms_order_realisations_mirror_agent.py
