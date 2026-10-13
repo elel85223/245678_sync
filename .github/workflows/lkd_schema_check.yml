@@ -1,0 +1,259 @@
+name: LKD schema check
+
+# Разовая сверка баз ПрофиСферы со снимком 25.09.2026 (документ «Структура БД нового ЛКД»)
+# после переезда из Yandex Cloud на серверы ПРОТЕКО.
+# Только чтение под учеткой из секретов LKD_PG_*, в базах ничего не меняет.
+# В лог: имена баз, таблиц и колонок, типы, ограничения, число строк, даты последних записей.
+# Пароли, адреса и содержимое строк в лог не попадают.
+# Раннер self-hosted в офисе: база ПрофиСферы пускает только с офисного адреса.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 20
+    steps:
+      - name: Драйвер PostgreSQL
+        shell: powershell
+        run: |
+          python -m pip install --quiet --disable-pip-version-check --upgrade --target .pylib "psycopg[binary]"
+          if ($LASTEXITCODE -ne 0) { throw "Не удалось установить psycopg" }
+
+      - name: Проверка баз
+        shell: python
+        env:
+          PYTHONIOENCODING: utf-8
+          LKD_PG_HOST: ${{ secrets.LKD_PG_HOST }}
+          LKD_PG_USER: ${{ secrets.LKD_PG_USER }}
+          LKD_PG_PASSWORD: ${{ secrets.LKD_PG_PASSWORD }}
+        run: |
+          # Проверка баз ПрофиСферы после переезда: список баз, таблицы, колонки, ограничения, строки.
+          # Только чтение. Пароли, адреса и данные строк в лог не печатает: только имена и счетчики.
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          sys.path.insert(0, os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), ".pylib"))
+          import psycopg  # noqa: E402
+          from psycopg import sql  # noqa: E402
+
+          # Снимок 25.09.2026 16:53 (readonly_user2, information_schema): база -> (таблиц, колонок)
+          BASE = {
+              "prod_admin_auth": (10, 70), "prod_baskets": (6, 49), "prod_bd_litics_connector": (6, 49),
+              "prod_bitrix_connector": (2, 10), "prod_catalog_catalog_cache": (25, 229),
+              "prod_catalog_offers": (6, 56), "prod_cislink_connector": (0, 0), "prod_cms": (13, 110),
+              "prod_communication": (8, 68), "prod_customer_auth": (10, 88), "prod_customers": (14, 125),
+              "prod_distributors_performance": (13, 161), "prod_erp_1c_connector": (2, 10),
+              "prod_logistic": (23, 261), "prod_loyality": (34, 309), "prod_marketing": (13, 120),
+              "prod_notification": (2, 10), "prod_oms": (25, 328), "prod_payments": (6, 50),
+              "prod_pim": (42, 406), "prod_prod_baskets": (0, 0), "prod_reports": (13, 108),
+              "prod_seller_auth": (13, 108), "prod_sellers": (14, 123), "prod_units_bu": (11, 102),
+          }
+          BASE_NO_ACCESS = ("db1", "postgres")  # 25.09 readonly-учеткам были недоступны
+          MARK_COLS = ("created_at", "updated_at", "last_success_at")
+          SYS = "('pg_catalog', 'information_schema')"
+          NOT_TEMP = "n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'"
+
+
+          def env(name):
+              value = os.environ.get(name)
+              if not value:
+                  sys.exit(f"Не задана переменная окружения {name}")
+              return value
+
+
+          def clean(value):
+              if value is None:
+                  return ""
+              text = str(value).replace("\\", "\\\\").replace("|", "\\p").replace("\r", "").replace("\n", "\\n")
+              return re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", text)
+
+
+          def out(tag, *fields):
+              print("@@" + tag + "|" + "|".join(clean(f) for f in fields), flush=True)
+
+
+          def first_line(exc):
+              return clean(str(exc).strip().split("\n")[0])[:200]
+
+
+          def connect(dbname):
+              conn = psycopg.connect(
+                  host=env("LKD_PG_HOST"), port=int(os.environ.get("LKD_PG_PORT") or 6432), dbname=dbname,
+                  user=env("LKD_PG_USER"), password=env("LKD_PG_PASSWORD"),
+                  sslmode=os.environ.get("LKD_PG_SSLMODE") or "require",
+                  sslrootcert="lkd-no-root-cert", connect_timeout=15, autocommit=True,
+              )
+              conn.prepare_threshold = None  # без серверных prepared statements (возможен пулер)
+              return conn
+
+
+          def is_type(dtype, udt, clen, nprec, nscale):
+              """Тип так же, как в снимке 25.09: data_type, udt_name, длина, точность."""
+              if dtype in ("USER-DEFINED", "ARRAY"):
+                  return udt
+              if clen is not None:
+                  return f"{dtype}({clen})"
+              if dtype == "numeric" and nprec is not None:
+                  return f"numeric({nprec}" + (f",{nscale}" if nscale is not None else "") + ")"
+              return dtype
+
+
+          def read_db(db, conn):
+              rels = conn.execute(f"""
+                  SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint,
+                         has_table_privilege(c.oid, 'SELECT'), obj_description(c.oid, 'pg_class'),
+                         (SELECT count(*) FROM pg_catalog.pg_index i WHERE i.indrelid = c.oid)
+                  FROM pg_catalog.pg_class c
+                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN {SYS} AND {NOT_TEMP}
+                  ORDER BY 1, 2""").fetchall()
+              visible = {(s, t) for s, t in conn.execute(f"""
+                  SELECT t.table_schema, t.table_name
+                  FROM information_schema.tables t
+                  WHERE t.table_schema NOT IN {SYS}""").fetchall()}
+              is_cols = {}
+              for s, t, c, *rest in conn.execute(f"""
+                      SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name,
+                             c.character_maximum_length, c.numeric_precision, c.numeric_scale
+                      FROM information_schema.columns c
+                      WHERE c.table_schema NOT IN {SYS}""").fetchall():
+                  is_cols[(s, t, c)] = is_type(*rest)
+              atts = conn.execute(f"""
+                  SELECT n.nspname, c.relname, a.attnum, a.attname,
+                         pg_catalog.format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
+                         pg_catalog.pg_get_expr(d.adbin, d.adrelid), col_description(c.oid, a.attnum)
+                  FROM pg_catalog.pg_attribute a
+                  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                  WHERE a.attnum > 0 AND NOT a.attisdropped
+                    AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN {SYS} AND {NOT_TEMP}
+                  ORDER BY 1, 2, 3""").fetchall()
+              cons = conn.execute(f"""
+                  SELECT n.nspname, cl.relname, con.conname, con.contype::text, pg_get_constraintdef(con.oid)
+                  FROM pg_catalog.pg_constraint con
+                  JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid
+                  JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
+                  WHERE n.nspname NOT IN {SYS}
+                  ORDER BY 1, 2, 4, 3""").fetchall()
+              exts = conn.execute("SELECT extname, extversion FROM pg_catalog.pg_extension ORDER BY 1").fetchall()
+
+              cols_by_rel = {}
+              for s, t, num, name, ftype, nullable, dflt, cmt in atts:
+                  cols_by_rel.setdefault((s, t), []).append(name)
+                  out("COL", db, s, t, num, name, ftype, is_cols.get((s, t, name), "-"),
+                      "да" if nullable else "", dflt, cmt)
+              for s, t, name, ctype, cdef in cons:
+                  out("CON", db, s, t, name, ctype, cdef)
+              for name, ver in exts:
+                  out("EXT", db, name, ver)
+
+              for s, t, kind, est, can_select, cmt, nidx in rels:
+                  rows, note, marks = "", "", ["", "", ""]
+                  if can_select and kind in ("r", "p", "m"):
+                      have = [m for m in MARK_COLS if m in cols_by_rel.get((s, t), [])]
+                      fields = [sql.SQL("count(*)")] + [
+                          sql.SQL("max({})::text").format(sql.Identifier(m)) for m in have]
+                      query = sql.SQL("SELECT {} FROM {}.{}").format(
+                          sql.SQL(", ").join(fields), sql.Identifier(s), sql.Identifier(t))
+                      try:
+                          with conn.transaction():
+                              conn.execute("SET LOCAL statement_timeout = '120s'")
+                              res = conn.execute(query).fetchone()
+                          rows = res[0]
+                          for m, v in zip(have, res[1:]):
+                              marks[MARK_COLS.index(m)] = v
+                      except Exception as exc:
+                          note = "ошибка подсчета: " + first_line(exc)
+                  elif not can_select:
+                      note = "нет прав SELECT"
+                  out("REL", db, s, t, kind, "да" if can_select else "нет", "да" if (s, t) in visible else "нет",
+                      est, nidx, rows, *marks, note, cmt)
+
+              n_col = sum(1 for (s, t, _c) in is_cols if (s, t) in visible)
+              return len(rels), len(visible), n_col
+
+
+          def check_db(db):
+              try:
+                  conn = connect(db)
+              except Exception as exc:  # нет доступа к базе
+                  out("DB", db, "ERR", first_line(exc))
+                  return None
+              try:
+                  with conn:
+                      res = read_db(db, conn)
+                  out("DB", db, "OK", "")
+                  return res
+              except Exception as exc:  # база открылась, но чтение каталога упало
+                  out("DB", db, "ERR", "чтение: " + first_line(exc))
+                  return None
+
+
+          def main():
+              started = datetime.now(timezone.utc)
+              print(f"Проверка баз ПрофиСферы, старт {started:%Y-%m-%d %H:%M:%S} UTC")
+              conn = None
+              for db in ("prod_reports", "prod_sellers", "prod_loyality"):
+                  try:
+                      conn = connect(db)
+                      break
+                  except Exception as exc:
+                      print(f"Подключение к {db} не удалось: {first_line(exc)}")
+              if conn is None:
+                  sys.exit("Ни одна база не открылась")
+              with conn:
+                  srv = conn.execute("""
+                      SELECT current_setting('server_version'), current_setting('TimeZone'),
+                             inet_server_port(), (now() AT TIME ZONE 'UTC')::text,
+                             pg_postmaster_start_time()::text""").fetchone()
+                  for key, val in zip(("server_version", "TimeZone", "inet_server_port", "now_utc",
+                                       "postmaster_start"), srv):
+                      out("SRV", key, val)
+                  dblist = conn.execute("""
+                      SELECT d.datname, d.datallowconn, d.datistemplate,
+                             has_database_privilege(d.datname, 'CONNECT'),
+                             pg_encoding_to_char(d.encoding), d.datcollate
+                      FROM pg_catalog.pg_database d ORDER BY 1""").fetchall()
+              for row in dblist:
+                  out("DATABASE", *row)
+
+              on_server = {d[0] for d in dblist}
+              names = [d[0] for d in dblist if d[1] and not d[2]]
+              names += [n for n in list(BASE) + list(BASE_NO_ACCESS) if n not in names]
+              result = {db: check_db(db) for db in names}
+
+              print()
+              print("ИТОГ: таблицы и колонки, видимые учетке; 25.09.2026 -> сейчас")
+              for db in names:
+                  res, base = result[db], BASE.get(db)
+                  if res is None:
+                      state = "нет доступа" if db in on_server else "базы нет на сервере"
+                      if db in BASE_NO_ACCESS:
+                          was = "25.09 тоже не было доступа"
+                      elif base:
+                          was = f"25.09: таблиц {base[0]}, колонок {base[1]}"
+                      else:
+                          was = "25.09 базы не было"
+                      print(f"  {db}: {state} ({was})")
+                      out("SUM", db, state, "", "", *(base or ("", "")), "")
+                      continue
+                  n_rel, n_tab, n_col = res
+                  hidden = f"; в каталоге еще {n_rel - n_tab} без прав" if n_rel > n_tab else ""
+                  if base is None:
+                      verdict = "теперь есть доступ" if db in BASE_NO_ACCESS else "новая база"
+                      print(f"  {db}: {verdict}, таблиц {n_tab}, колонок {n_col}{hidden}")
+                      out("SUM", db, n_tab, n_col, n_rel, "", "", verdict)
+                      continue
+                  verdict = "совпадает" if (n_tab, n_col) == base else "ОТЛИЧАЕТСЯ"
+                  print(f"  {db}: таблиц {base[0]} -> {n_tab}, колонок {base[1]} -> {n_col} — {verdict}{hidden}")
+                  out("SUM", db, n_tab, n_col, n_rel, base[0], base[1], verdict)
+              print(f"Готово за {(datetime.now(timezone.utc) - started).seconds} с. Полный вывод — строки @@ выше.")
+
+
+          if __name__ == "__main__":
+              main()
