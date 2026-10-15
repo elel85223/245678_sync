@@ -2,8 +2,14 @@
 Агент зеркала: реализации заказов интернет-магазина из ЛКД -> litics.pf_oms_order_realisations.
 
 Источник (база ПрофиСферы, только чтение):
-  prod_oms.public.order_realisations + orders - номер и дата реализации, номер заказа ИМ, дистрибьютор;
-  prod_sellers.public.distributors            - distributors.id -> bd_litics_id (= litics.partners.id).
+  prod_oms.public.orders           - номер и дата реализации (realisation_number, realisation_date),
+                                     номер заказа ИМ, дистрибьютор;
+  prod_sellers.public.distributors - distributors.id -> bd_litics_id (= litics.partners.id).
+
+С миграции prod_oms 2026_10_05_192839_denormillize_realisations_to_orders (деплой 15.10.2026)
+таблицы order_realisations нет: у заказа одна реализация, ее номер и дата лежат в orders.
+Ключ зеркала id = orders.id (= order_id). Своего времени создания и изменения у реализации нет,
+created_at и updated_at в зеркале пишутся NULL.
 
 Поиск документа Sell Out (litics.sales) у дистрибьютора за дату реализации, без учета регистра:
   1 - номер = код документа без суффикса даты (_ГГГГММДД или _ДД-ММ-ГГГГ);
@@ -49,16 +55,16 @@ DELETE_MISSING = True  # зеркало для Power BI: удаленные в �
 
 REALISATIONS_SQL = """
     SELECT
-        r.id,
-        r.order_id,
+        o.id,
+        o.id                                                  AS order_id,
         o.number::text                                        AS order_number,
         COALESCE(o.assigned_distributor_id, o.distributor_id) AS lkd_distributor_id,
-        r.number                                              AS realisation_number,
-        r.date                                                AS realisation_date,
-        r.created_at,
-        r.updated_at
-    FROM public.order_realisations r
-    JOIN public.orders o ON o.id = r.order_id
+        o.realisation_number,
+        o.realisation_date
+    FROM public.orders o
+    WHERE o.realisation_number IS NOT NULL
+      AND btrim(o.realisation_number) <> ''
+      AND o.realisation_date IS NOT NULL
 """
 DISTRIBUTORS_SQL = "SELECT d.id, d.bd_litics_id FROM public.distributors d"
 # =============================================
@@ -204,8 +210,8 @@ def load_source():
             "realisation_date": r["realisation_date"],
             "sale_code": None,
             "match_rule": None,
-            "created_at": msk(r["created_at"]),
-            "updated_at": msk(r["updated_at"]),
+            "created_at": None,  # у реализации в orders нет своего времени создания
+            "updated_at": None,  # и изменения
         }
     return rows
 
@@ -356,7 +362,7 @@ def main():
         sys.exit(f"MODE должен быть dry или write, получено: {mode}")
     db = env("LITICS_DB_NAME", "litics")
     print(f"Режим: {mode}, запуск {datetime.now():%Y-%m-%d %H:%M:%S}")
-    print(f"Источник: prod_oms (order_realisations, orders), prod_sellers (distributors); "
+    print(f"Источник: prod_oms (orders.realisation_number, realisation_date), prod_sellers (distributors); "
           f"цель: {TARGET_TABLE}, ключ: {', '.join(KEYS)}")
 
     source = load_source()
