@@ -1,10 +1,12 @@
 name: LKD health mirror
 
-# Зеркала данных нового ЛКД в Litics (таблицы pf_*) для страницы сверки lkd-health.php старого ЛК.
+# Зеркала данных нового ЛКД в Litics (таблицы pf_*) для страницы сверки lkd-health.php старого ЛК
+# и для дашборда подарков ПЛ, плюс реестр подарков из Google-таблицы (gs_gifts_registry).
 # Раннер self-hosted в офисе: база ПрофиСферы пускает только с офисного адреса.
 # ПрофиСфера: секреты LKD_PG_* (readonly). Litics: адрес и база — DB_HOST и DB_NAME,
-# учетка — LITICS_MIRROR_USER и LITICS_MIRROR_PASSWORD.
-# Агент пишет только в 8 таблиц pf_* и pf_mirror_runs, все одной транзакцией.
+# учетка — LITICS_MIRROR_USER и LITICS_MIRROR_PASSWORD. Google-таблица: сервисный аккаунт GOOGLE_SA_JSON, только чтение.
+# Две группы зеркал: «lkd-health» (8 таблиц pf_*) и «подарки ПЛ» (5 таблиц pf_* и gs_gifts_registry).
+# Каждая группа и ее отметки в pf_mirror_runs пишутся одной транзакцией; ошибка одной группы не мешает другой.
 # Ручной запуск: dry (без записи) или write. По расписанию — write каждый час в :20.
 
 on:
@@ -30,7 +32,7 @@ jobs:
     runs-on: [self-hosted, Windows]
     timeout-minutes: 15
     steps:
-      - name: Зеркала ЛКД для lkd-health
+      - name: Зеркала ЛКД для lkd-health и подарков ПЛ
         shell: python
         env:
           PYTHONIOENCODING: utf-8
@@ -42,24 +44,35 @@ jobs:
           LITICS_DB_NAME: ${{ secrets.DB_NAME }}
           LITICS_DB_USER: ${{ secrets.LITICS_MIRROR_USER }}
           LITICS_DB_PASSWORD: ${{ secrets.LITICS_MIRROR_PASSWORD }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          GIFTS_SHEET_ID: '16S0zru6DLGVj4QU_fehVeBzoH2wzJOu8SBKSOyrIefo'
+          GIFTS_SHEET_NAME: 'Лист1'
         run: |
-          # Зеркала данных нового ЛКД (ПрофиСфера, PostgreSQL) в Litics для страницы сверки lkd-health.php старого ЛК.
-          # Читает базы ЛКД под readonly-учеткой (секреты LKD_PG_*). Пишет только в таблицы pf_* из списка MIRRORS
-          # и в pf_mirror_runs (учетка из секретов LITICS_MIRROR_*). Все таблицы пишутся одной транзакцией:
-          # страница видит либо прежнее состояние, либо новое целиком. pf_mirror_runs.read_at — на какой момент
-          # прочитан ЛКД (МСК). Время ЛКД (UTC) в зеркалах — МСК, кроме date_to_utc и external_created_at (как в ЛКД).
+          # Зеркала данных нового ЛКД (ПрофиСфера, PostgreSQL) в Litics: для страницы сверки lkd-health.php старого ЛК
+          # (группа HEALTH) и для дашборда подарков ПЛ (группа GIFTS, в нее входит реестр подарков из Google-таблицы).
+          # Читает базы ЛКД под readonly-учеткой (секреты LKD_PG_*), Google-таблицу — сервисным аккаунтом с правом
+          # только на чтение. Пишет только в таблицы из списков HEALTH и GIFTS и в pf_mirror_runs (учетка из секретов
+          # LITICS_MIRROR_*). Каждая группа пишется одной транзакцией: страница и дашборд видят либо прежнее состояние
+          # группы, либо новое целиком; ошибка одной группы не отменяет запись другой, но прогон помечается упавшим.
+          # pf_mirror_runs.read_at — на какой момент прочитан источник (МСК). Время ЛКД (UTC) в зеркалах — МСК,
+          # кроме date_to_utc и external_created_at (как в ЛКД).
           # MODE: dry — сравнение без записи (по умолчанию), write — запись.
-          # В лог — только счетчики, id и имена колонок: логи публичного репозитория видит любой пользователь GitHub.
+          # В лог — только счетчики, id, номера строк реестра и имена колонок: логи публичного репозитория видит
+          # любой пользователь GitHub.
           import importlib
+          import json
           import os
           import re
           import subprocess
           import sys
           from collections import Counter
-          from datetime import datetime, timedelta, timezone
+          from datetime import date, datetime, timedelta, timezone
           from decimal import Decimal
+          from urllib.parse import quote
 
           LIB = os.path.join(os.environ.get("GITHUB_WORKSPACE") or os.getcwd(), ".pylib_lkdh")
+          GOOGLE_MODULES = ("google", "requests", "urllib3", "certifi", "charset_normalizer", "idna", "cachetools",
+                            "rsa", "pyasn1", "pyasn1_modules", "cryptography", "cffi", "_cffi_backend", "pycparser")
 
 
           def ensure_libs():
@@ -86,6 +99,27 @@ jobs:
               print("Установлены psycopg и pymysql")
 
 
+          def ensure_google():
+              """google-auth и requests для чтения Google-таблицы ставятся один раз в ту же папку, что psycopg и pymysql.
+              Нужны только группе GIFTS: если установка не удалась, падает только она."""
+              try:
+                  importlib.import_module("google.oauth2.service_account")
+                  importlib.import_module("google.auth.transport.requests")
+                  return
+              except ImportError:
+                  for name in [n for n in sys.modules if n.split(".")[0] in GOOGLE_MODULES]:
+                      del sys.modules[name]
+              res = subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+                   "--upgrade", "--target", LIB, "google-auth", "requests"],
+                  capture_output=True, text=True, errors="replace")
+              if res.returncode != 0:
+                  print((res.stdout + res.stderr)[-1500:])
+                  raise RuntimeError("Не удалось установить google-auth и requests")
+              importlib.invalidate_caches()
+              print("Установлены google-auth и requests")
+
+
           ensure_libs()
           import psycopg  # noqa: E402
           import pymysql  # noqa: E402
@@ -96,9 +130,15 @@ jobs:
           FAILED_DAYS = 7                   # упавшие задачи ЛКД хранятся в зеркале за столько дней
           CHUNK = 500                       # строк в одном пакете записи
           SHOW = 10                         # сколько ключей печатать в примерах
-          DB_ORDER = ("prod_bd_litics_connector", "prod_sellers", "prod_oms", "prod_payments")
+          DB_ORDER = ("prod_bd_litics_connector", "prod_sellers", "prod_oms", "prod_payments",
+                      "prod_loyality", "prod_customers")
           DB_LABEL = {"prod_bd_litics_connector": "connector", "prod_sellers": "sellers",
-                      "prod_oms": "oms", "prod_payments": "payments"}
+                      "prod_oms": "oms", "prod_payments": "payments",
+                      "prod_loyality": "loyality", "prod_customers": "customers"}
+          SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+          SERIAL_EPOCH = date(1899, 12, 30)  # день 0 дат Google-таблиц
+          DATE_FORMATS = ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y")
+          LOOKALIKE = str.maketrans("aceopxyk", "асеорхук")  # латиница, похожая на кириллицу -> кириллица
 
           # Синки читаются раньше заказов и реализаций: окно синка в зеркале не может обогнать заказы,
           # иначе страница сочла бы пропуском заказ, который просто записан в ЛКД после чтения.
@@ -112,7 +152,8 @@ jobs:
           )
           SYNC_COLS = "s.distributor_id, {kind} AS kind, s.date_to AS date_to_utc, s.last_success_at, s.last_failed_at, s.status"
 
-          MIRRORS = [
+          # Группа «lkd-health»: зеркала для страницы сверки lkd-health.php
+          HEALTH = [
               {"label": "синки connector", "table": "pf_bd_litics_connector_syncs",
                "keys": ("distributor_id", "kind"), "utc": ("last_success_at", "last_failed_at"),
                "parts": [
@@ -151,7 +192,83 @@ jobs:
                           " c.deleted_at FROM public.contracts c")]},
           ]
 
-          TABLE_RE = re.compile(r"pf_[a-z0-9_]+")
+          # Первый переход задания в статус по журналу: по нему дата передачи и получения подарка клиникой
+          GIFT_TASKS_SQL = (
+              "WITH lg AS ("
+              " SELECT l.gift_logistics_task_id AS task_id,"
+              " min(l.created_at) FILTER (WHERE l.status = 'transferred_to_clinic') AS transferred_at,"
+              " min(l.created_at) FILTER (WHERE l.status = 'received_by_clinic') AS received_at"
+              " FROM public.gift_logistics_task_status_logs l"
+              " GROUP BY l.gift_logistics_task_id)"
+              " SELECT t.id, t.legacy_gift_item_id, t.article, t.upd_number, t.quantity, t.status,"
+              " t.sheet_lk_status_text, t.removed_from_sheet_at, lg.transferred_at, lg.received_at"
+              " FROM public.gift_logistics_tasks t"
+              " LEFT JOIN lg ON lg.task_id = t.id"
+          )
+
+          # Группа «подарки ПЛ»: зеркала для дашборда подарков (листы 22–24 аналитической записки)
+          GIFTS = [
+              {"label": "призы ПЛ и ФА", "table": "pf_loyality_bonus_operation_gift_items", "keys": ("id",),
+               "utc": ("created_at",),
+               "parts": [("prod_loyality",
+                          "SELECT gi.id, o.clinic_id, gi.issuance_type, gi.gift_id, g.name AS gift_name,"
+                          " gi.gift_quantity, gi.status, gi.created_at"
+                          " FROM public.bonus_operation_gift_items gi"
+                          " LEFT JOIN public.bonus_operations o ON o.id = gi.bonus_operation_id"
+                          " LEFT JOIN public.gifts g ON g.id = gi.gift_id")]},
+              {"label": "бонусные операции", "table": "pf_loyality_bonus_operations", "keys": ("id",),
+               "utc": ("created_at",),
+               "parts": [("prod_loyality",
+                          "SELECT o.id, o.clinic_id, o.type, o.sum_bonuses, o.created_at"
+                          " FROM public.bonus_operations o")]},
+              {"label": "задания логистики", "table": "pf_loyality_gift_logistics_tasks", "keys": ("id",),
+               "utc": ("removed_from_sheet_at", "transferred_at", "received_at"),
+               "parts": [("prod_loyality", GIFT_TASKS_SQL)]},
+              {"label": "акции", "table": "pf_loyality_promotions", "keys": ("id",), "utc": (),
+               "parts": [("prod_loyality",
+                          "SELECT p.id, p.type, p.name, p.start_date, p.end_date, p.issued_count"
+                          " FROM public.promotions p")]},
+              {"label": "клиники с учеткой", "table": "pf_customers_clinics", "keys": ("id",), "utc": ("registered_at",),
+               "parts": [("prod_customers",
+                          "SELECT c.id, c.inn, c.is_active, cu.id AS customer_id, cu.created_at AS registered_at"
+                          " FROM public.clinics c"
+                          " JOIN public.customers cu ON cu.id = c.customer_id")]},
+              {"label": "реестр подарков", "table": "gs_gifts_registry", "keys": ("sheet_row",), "utc": (),
+               "parts": [], "sheet": True},
+          ]
+
+          GROUPS = (("lkd-health", HEALTH), ("подарки ПЛ", GIFTS))
+          MIRRORS = HEALTH + GIFTS
+
+          # Колонки реестра: колонка зеркала, заголовок в Google-таблице, тип.
+          # Контакты клиник (адрес, пользователь, почта, телефон) не читаются.
+          REGISTRY = (
+              ("npp", "№ п/п", "text"),
+              ("warehouse", "Склад", "text"),
+              ("sz_number", "СЗ", "text"),
+              ("number_1c", "№ в 1С", "text"),
+              ("write_off_date", "Дата списания", "date"),
+              ("clinic_inn", "ИНН Клиники", "text"),
+              ("clinic_name", "Наименование клиники", "text"),
+              ("article", "Артикул", "text"),
+              ("gift_name", "Бонус", "text"),
+              ("distributor_name", "Дистрибьютор", "text"),
+              ("quantity", "Количество", "int"),
+              ("gift_issued_date", "Дата вывода подарка", "date"),
+              ("shipment_date", "Дата отгрузки дистрибьютору", "date"),
+              ("upd_number", "Номер счет-фактуры", "text"),
+              ("invoice_date", "Дата с/ф", "date"),
+              ("status_text", "Статус", "text"),
+              ("gift_item_id", "gift_item_id (БД ПЛ)", "int"),
+              ("promotion_type", "ТипАкции", "text"),
+              ("db", "ДБ", "text"),
+              ("ttn", "ТТН", "text"),
+              ("courier_handover_date", "Дата передачи в СДЭК/водителю", "date"),
+              ("estimated_delivery_date", "Примерная дата доставки", "date"),
+              ("clinic_handover_date", "Дата передачи клинике подарка", "date"),
+          )
+
+          TABLE_RE = re.compile(r"(?:pf|gs)_[a-z0-9_]+")
           ALLOWED = frozenset([m["table"] for m in MIRRORS] + [RUNS])
 
 
@@ -162,13 +279,21 @@ jobs:
               return value
 
 
+          def need(name):
+              """Обязательная переменная группы GIFTS: без нее падает только группа, а не весь прогон."""
+              value = os.environ.get(name)
+              if not value:
+                  raise RuntimeError(f"Не задана переменная окружения {name}")
+              return value
+
+
           def safe(text):
               """Без IP-адресов: лог публичный."""
               return re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", str(text))
 
 
           def q_table(name):
-              """Единственный способ получить имя таблицы для SQL Litics: только свои таблицы pf_*."""
+              """Единственный способ получить имя таблицы для SQL Litics: только свои таблицы pf_* и gs_*."""
               if name not in ALLOWED or not TABLE_RE.fullmatch(name):
                   raise RuntimeError(f"Таблица {name} не из списка зеркал агента, работа с ней запрещена")
               return "`" + name + "`"
@@ -234,12 +359,105 @@ jobs:
               return str(key[0]) if len(key) == 1 else "(" + ", ".join(map(str, key)) + ")"
 
 
-          def read_sources():
-              """Все части всех зеркал: по одному подключению и одному снимку на базу, в порядке DB_ORDER."""
-              src = {m["table"]: {"cols": None, "rows": {}} for m in MIRRORS}
+          def norm_header(text):
+              """Заголовок колонки реестра для сопоставления: без лишних пробелов, регистра и латиницы вместо кириллицы."""
+              return re.sub(r"\s+", " ", str(text or "").replace("\xa0", " ")).strip().lower().translate(LOOKALIKE)
+
+
+          def cell_text(value):
+              """Ячейка Google-таблицы -> текст; пустая -> None. Целые числа без «.0»."""
+              if value is None or value == "":
+                  return None
+              if isinstance(value, bool):
+                  return "TRUE" if value else "FALSE"
+              if isinstance(value, float) and value.is_integer():
+                  value = int(value)
+              text = re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
+              return text or None
+
+
+          def convert(value, kind):
+              """Ячейка реестра -> (значение для Litics, распознано ли). Пустая ячейка -> (None, True)."""
+              text = cell_text(value)
+              if kind == "text" or text is None:
+                  return text, True
+              number = isinstance(value, (int, float)) and not isinstance(value, bool)
+              if kind == "int":
+                  if number:
+                      return (int(value), True) if float(value).is_integer() else (None, False)
+                  digits = text.replace(" ", "")
+                  return (int(digits), True) if re.fullmatch(r"-?\d+", digits) else (None, False)
+              if number:  # дата: число дней от 30.12.1899
+                  day = SERIAL_EPOCH + timedelta(days=int(value))
+                  return (day, True) if 2000 <= day.year <= 2100 else (None, False)
+              first = text.split(" ")[0]
+              for fmt in DATE_FORMATS:
+                  try:
+                      day = datetime.strptime(first, fmt).date()
+                  except ValueError:
+                      continue
+                  return (day, True) if 2000 <= day.year <= 2100 else (None, False)
+              return None, False
+
+
+          def read_registry():
+              """Реестр подарков из Google-таблицы: колонки REGISTRY, ключ — номер строки листа.
+              Возвращает колонки, строки, время чтения (МСК) и счетчик нераспознанных значений по колонкам."""
+              ensure_google()
+              from google.auth.transport.requests import AuthorizedSession
+              from google.oauth2 import service_account
+              try:
+                  info = json.loads(need("GOOGLE_SA_JSON"))
+              except json.JSONDecodeError:
+                  raise RuntimeError("Секрет GOOGLE_SA_JSON — не JSON") from None
+              creds = service_account.Credentials.from_service_account_info(info, scopes=[SHEETS_SCOPE])
+              sheet_range = "'" + env("GIFTS_SHEET_NAME", "Лист1").replace("'", "''") + "'"
+              read_at = datetime.now(MSK).replace(tzinfo=None, microsecond=0)
+              resp = AuthorizedSession(creds).get(
+                  "https://sheets.googleapis.com/v4/spreadsheets/" + need("GIFTS_SHEET_ID")
+                  + "/values/" + quote(sheet_range, safe=""),
+                  params={"valueRenderOption": "UNFORMATTED_VALUE", "dateTimeRenderOption": "SERIAL_NUMBER"},
+                  timeout=120)
+              if resp.status_code != 200:
+                  raise RuntimeError(f"Google Sheets API ответил HTTP {resp.status_code}")
+              values = resp.json().get("values") or []
+              if not values:
+                  raise RuntimeError("Реестр пустой: нет строки заголовков")
+
+              header = [norm_header(h) for h in values[0]]
+              pos, missing = {}, []
+              for col, title, _kind in REGISTRY:
+                  found = [i for i, h in enumerate(header) if h == norm_header(title)]
+                  if len(found) > 1:
+                      raise RuntimeError(f"Реестр: колонка «{title}» встречается {len(found)} раза")
+                  if found:
+                      pos[col] = found[0]
+                  else:
+                      missing.append(f"«{title}»")
+              if missing:
+                  raise RuntimeError("Реестр: нет колонок " + ", ".join(missing))
+
+              cols = ["sheet_row"] + [col for col, _title, _kind in REGISTRY]
+              rows, bad = {}, Counter()
+              for n, raw in enumerate(values[1:], start=2):
+                  row = {"sheet_row": n}
+                  for col, _title, kind in REGISTRY:
+                      i = pos[col]
+                      row[col], ok = convert(raw[i] if i < len(raw) else None, kind)
+                      if not ok:
+                          bad[col] += 1
+                  if any(row[c] is not None for c in cols[1:]):  # полностью пустые строки листа пропускаются
+                      rows[(n,)] = row
+              return cols, rows, read_at, bad
+
+
+          def read_sources(mirrors):
+              """Все части зеркал группы: по одному подключению и одному снимку на базу, в порядке DB_ORDER.
+              Реестр подарков — из Google-таблицы."""
+              src = {m["table"]: {"cols": None, "rows": {}} for m in mirrors}
               read_at = {}
               for db in DB_ORDER:
-                  parts = [(m, sql) for m in MIRRORS for d, sql in m["parts"] if d == db]
+                  parts = [(m, sql) for m in mirrors for d, sql in m["parts"] if d == db]
                   if not parts:
                       continue
                   with pg_connect(db) as conn:
@@ -262,15 +480,27 @@ jobs:
                               if key in box["rows"]:
                                   raise RuntimeError(f"{m['label']}: в ЛКД повторяется ключ {fmt_key(key)}")
                               box["rows"][key] = row
-              for m in MIRRORS:
-                  src[m["table"]]["read_at"] = min(read_at[d] for d, _sql in m["parts"])
-              return src, read_at
+              if read_at:
+                  times = sorted(read_at.values())
+                  print(f"ЛКД прочитан: {times[0]:%d.%m.%Y %H:%M:%S} — {times[-1]:%H:%M:%S} МСК, базы: "
+                        + ", ".join(DB_LABEL[d] for d in DB_ORDER if d in read_at))
+              for m in mirrors:
+                  box = src[m["table"]]
+                  if m.get("sheet"):
+                      box["cols"], box["rows"], box["read_at"], bad = read_registry()
+                      print(f"Реестр прочитан: {box['read_at']:%d.%m.%Y %H:%M:%S} МСК, строк с данными {len(box['rows'])}")
+                      if bad:
+                          print("  не распознаны и оставлены пустыми: "
+                                + ", ".join(f"{c} {n}" for c, n in bad.most_common()))
+                  else:
+                      box["read_at"] = min(read_at[d] for d, _sql in m["parts"])
+              return src
 
 
           def lacking_rights(lit):
               """Каких прав на таблицы агента нет у учетки Litics (по SHOW GRANTS; права через роли не видны)."""
               db = env("LITICS_DB_NAME", "litics")
-              need = {"SELECT", "INSERT", "UPDATE", "DELETE"}
+              need_rights = {"SELECT", "INSERT", "UPDATE", "DELETE"}
               have = {t: set() for t in ALLOWED}
               with lit.cursor() as cur:
                   cur.execute("SHOW GRANTS FOR CURRENT_USER()")
@@ -282,11 +512,11 @@ jobs:
                   target = m.group(2).replace("`", "")
                   privs = {p.split("(")[0].strip().upper() for p in m.group(1).split(",")}
                   if "ALL PRIVILEGES" in privs or "ALL" in privs:
-                      privs = set(need)
+                      privs = set(need_rights)
                   for t in ALLOWED:
                       if target in ("*.*", f"{db}.*", f"{db}.{t}"):
                           have[t] |= privs
-              return {t: sorted(need - have[t]) for t in sorted(ALLOWED) if need - have[t]}
+              return {t: sorted(need_rights - have[t]) for t in sorted(ALLOWED) if need_rights - have[t]}
 
 
           def load_mirror(lit, table, cols, keys):
@@ -326,66 +556,76 @@ jobs:
                       cur.executemany(sql, [list(k) for k in deletes[i:i + CHUNK]])
 
 
+          def run_group(lit, mirrors, mode):
+              """Одна группа зеркал: чтение источников, сравнение с зеркалами и запись одной транзакцией."""
+              src = read_sources(mirrors)
+              plan, total_up, total_del = [], 0, 0
+              for m in mirrors:
+                  box = src[m["table"]]
+                  mirror = load_mirror(lit, m["table"], box["cols"], m["keys"])
+                  new_keys, changed, missing, col_stat = compare(box["rows"], mirror, box["cols"])
+                  source_name = "в реестре" if m.get("sheet") else "в ЛКД"
+                  line = (f"{m['label']}: {source_name} {len(box['rows'])}, в зеркале {len(mirror)}; новые {len(new_keys)},"
+                          f" изменились {len(changed)}")
+                  if col_stat:
+                      line += " (" + ", ".join(f"{c} {n}" for c, n in col_stat.most_common()) + ")"
+                  line += f", удалить {len(missing)}"
+                  print(line)
+                  if changed:
+                      print(f"  изменились, ключи (первые {SHOW}): " + ", ".join(fmt_key(k) for k in changed[:SHOW]))
+                  if missing:
+                      print(f"  удалить, ключи (первые {SHOW}): " + ", ".join(fmt_key(k) for k in missing[:SHOW]))
+                  rows = [box["rows"][k] for k in new_keys + changed]
+                  plan.append((m, box, rows, missing))
+                  total_up += len(rows)
+                  total_del += len(missing)
+
+              if mode == "dry":
+                  print(f"Режим dry: запись не выполнялась. К записи {total_up} строк, к удалению {total_del}.")
+                  return
+
+              try:
+                  with lit.cursor() as cur:
+                      for m, box, rows, missing in plan:
+                          write_mirror(cur, m["table"], box["cols"], m["keys"], rows, missing)
+                          cur.execute(
+                              f"INSERT INTO {q_table(RUNS)} (`mirror`, `read_at`, `finished_at`, `source_rows`,"
+                              " `written_rows`, `deleted_rows`) VALUES (%s, %s, NOW(), %s, %s, %s)"
+                              " ON DUPLICATE KEY UPDATE `read_at` = VALUES(`read_at`), `finished_at` = VALUES(`finished_at`),"
+                              " `source_rows` = VALUES(`source_rows`), `written_rows` = VALUES(`written_rows`),"
+                              " `deleted_rows` = VALUES(`deleted_rows`)",
+                              (m["table"], box["read_at"], len(box["rows"]), len(rows), len(missing)))
+                  lit.commit()
+              except Exception:
+                  lit.rollback()
+                  raise
+              print(f"Записано строк: {total_up}, удалено: {total_del}. Отметка прогона обновлена для {len(plan)} зеркал.")
+
+
           def main():
               mode = (env("MODE", "dry") or "dry").strip().lower()
               if mode not in ("dry", "write"):
                   sys.exit(f"MODE должен быть dry или write, получено: {mode}")
-              print(f"Зеркала ЛКД для lkd-health, режим {mode}, запуск {datetime.now(MSK):%d.%m.%Y %H:%M:%S} МСК")
+              print(f"Зеркала ЛКД и реестра подарков, режим {mode}, запуск {datetime.now(MSK):%d.%m.%Y %H:%M:%S} МСК")
 
-              src, read_at = read_sources()
-              times = sorted(read_at.values())
-              print(f"ЛКД прочитан: {times[0]:%d.%m.%Y %H:%M:%S} — {times[-1]:%H:%M:%S} МСК, базы: "
-                    + ", ".join(DB_LABEL[d] for d in DB_ORDER if d in read_at))
-
+              failed = []
               lit = lit_connect()
               try:
                   if mode == "dry":
                       lacking = lacking_rights(lit)
                       print("Права на запись в таблицы зеркал: " + ("есть" if not lacking else "нет — " + "; ".join(
                           f"{t}: {', '.join(p)}" for t, p in lacking.items())))
-
-                  plan, total_up, total_del = [], 0, 0
-                  for m in MIRRORS:
-                      box = src[m["table"]]
-                      mirror = load_mirror(lit, m["table"], box["cols"], m["keys"])
-                      new_keys, changed, missing, col_stat = compare(box["rows"], mirror, box["cols"])
-                      line = (f"{m['label']}: в ЛКД {len(box['rows'])}, в зеркале {len(mirror)}; новые {len(new_keys)},"
-                              f" изменились {len(changed)}")
-                      if col_stat:
-                          line += " (" + ", ".join(f"{c} {n}" for c, n in col_stat.most_common()) + ")"
-                      line += f", удалить {len(missing)}"
-                      print(line)
-                      if changed:
-                          print(f"  изменились, ключи (первые {SHOW}): " + ", ".join(fmt_key(k) for k in changed[:SHOW]))
-                      if missing:
-                          print(f"  удалить, ключи (первые {SHOW}): " + ", ".join(fmt_key(k) for k in missing[:SHOW]))
-                      rows = [box["rows"][k] for k in new_keys + changed]
-                      plan.append((m, box, rows, missing))
-                      total_up += len(rows)
-                      total_del += len(missing)
-
-                  if mode == "dry":
-                      print(f"\nРежим dry: запись не выполнялась. К записи {total_up} строк, к удалению {total_del}.")
-                      return
-
-                  try:
-                      with lit.cursor() as cur:
-                          for m, box, rows, missing in plan:
-                              write_mirror(cur, m["table"], box["cols"], m["keys"], rows, missing)
-                              cur.execute(
-                                  f"INSERT INTO {q_table(RUNS)} (`mirror`, `read_at`, `finished_at`, `source_rows`,"
-                                  " `written_rows`, `deleted_rows`) VALUES (%s, %s, NOW(), %s, %s, %s)"
-                                  " ON DUPLICATE KEY UPDATE `read_at` = VALUES(`read_at`), `finished_at` = VALUES(`finished_at`),"
-                                  " `source_rows` = VALUES(`source_rows`), `written_rows` = VALUES(`written_rows`),"
-                                  " `deleted_rows` = VALUES(`deleted_rows`)",
-                                  (m["table"], box["read_at"], len(box["rows"]), len(rows), len(missing)))
-                      lit.commit()
-                  except Exception:
-                      lit.rollback()
-                      raise
-                  print(f"\nЗаписано строк: {total_up}, удалено: {total_del}. Отметка прогона обновлена для {len(plan)} зеркал.")
+                  for name, mirrors in GROUPS:
+                      print(f"\n== Группа «{name}»")
+                      try:
+                          run_group(lit, mirrors, mode)
+                      except Exception as exc:  # другая группа все равно пишется
+                          print(f"ОШИБКА в группе «{name}»: {type(exc).__name__}: {safe(exc)}")
+                          failed.append(name)
               finally:
                   lit.close()
+              if failed:
+                  sys.exit("Группы с ошибкой: " + ", ".join(failed))
 
 
           if __name__ == "__main__":
