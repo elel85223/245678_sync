@@ -267,6 +267,9 @@ jobs:
               ("estimated_delivery_date", "Примерная дата доставки", "date"),
               ("clinic_handover_date", "Дата передачи клинике подарка", "date"),
           )
+          # Колонки реестра, у которых в Google-таблице пустой заголовок: берется колонка без заголовка
+          # сразу справа от указанной. 26.10.2026 у «№ в 1С» (колонка D) заголовка нет, данные в колонке есть.
+          UNTITLED_AFTER = {"number_1c": "СЗ"}
 
           TABLE_RE = re.compile(r"(?:pf|gs)_[a-z0-9_]+")
           ALLOWED = frozenset([m["table"] for m in MIRRORS] + [RUNS])
@@ -430,12 +433,19 @@ jobs:
                   found = [i for i, h in enumerate(header) if h == norm_header(title)]
                   if len(found) > 1:
                       raise RuntimeError(f"Реестр: колонка «{title}» встречается {len(found)} раза")
+                  if not found and col in UNTITLED_AFTER:
+                      left = [i for i, h in enumerate(header) if h == norm_header(UNTITLED_AFTER[col])]
+                      if len(left) == 1 and left[0] + 1 < len(header) and not re.search(r"\w", header[left[0] + 1]):
+                          found = [left[0] + 1]
+                          print(f"Реестр: «{title}» — колонка без заголовка справа от «{UNTITLED_AFTER[col]}»")
                   if found:
                       pos[col] = found[0]
                   else:
                       missing.append(f"«{title}»")
               if missing:
-                  raise RuntimeError("Реестр: нет колонок " + ", ".join(missing))
+                  # Заголовки колонок — не данные клиник, их можно показать в публичном логе
+                  raise RuntimeError("Реестр: нет колонок " + ", ".join(missing) + ". Заголовки в таблице: "
+                                     + " | ".join(str(h).strip() for h in values[0]))
 
               cols = ["sheet_row"] + [col for col, _title, _kind in REGISTRY]
               rows, bad = {}, Counter()
