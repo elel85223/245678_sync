@@ -229,11 +229,13 @@ jobs:
                "parts": [("prod_loyality",
                           "SELECT p.id, p.type, p.name, p.start_date, p.end_date, p.issued_count"
                           " FROM public.promotions p")]},
-              {"label": "клиники с учеткой", "table": "pf_customers_clinics", "keys": ("id",), "utc": ("registered_at",),
+              # Все клиники ПЛ. У клиники без учетки ЛК customer_id и registered_at пустые: подарки такие клиники
+              # тоже получают, и для листа 25 записки они нужны.
+              {"label": "клиники ПЛ", "table": "pf_customers_clinics", "keys": ("id",), "utc": ("registered_at",),
                "parts": [("prod_customers",
                           "SELECT c.id, c.inn, c.is_active, cu.id AS customer_id, cu.created_at AS registered_at"
                           " FROM public.clinics c"
-                          " JOIN public.customers cu ON cu.id = c.customer_id")]},
+                          " LEFT JOIN public.customers cu ON cu.id = c.customer_id")]},
               {"label": "реестр подарков", "table": "gs_gifts_registry", "keys": ("sheet_row",), "utc": (),
                "parts": [], "sheet": True},
           ]
